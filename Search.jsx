@@ -19,10 +19,6 @@
  *   columnApi            pre-v31 AG Grid column API (v31+ merged it into gridApi)
  *   setOrderBy           receives the AMPS `orderby` option string from ORDER BY
  *                        clauses (e.g. "/price DESC, /symbol ASC"), or '' if none
- *   getValueSuggestions  (fieldDef, partial) => string[] | Promise<string[]>
- *                        backs the Values dropdown (viewport grids don't hold the
- *                        full dataset client-side, so source this from a reference
- *                        topic / distinct-values endpoint)
  *   autoApply            default true — push to setFilter on every valid edit;
  *                        false = only on Enter / Search button
  *   debounceMs           default 400
@@ -260,7 +256,6 @@ export default function Search({
   columnApi,
   setFilter,
   setOrderBy,
-  getValueSuggestions,
   autoApply = true,
   debounceMs = 400,
   storageKey = 'jql-amps-recent',
@@ -276,7 +271,6 @@ export default function Search({
   // FULL suggestion list for that slot and replace the token on select.
   // typing (onChange) switches back to prefix-filtered autocomplete.
   const [browse, setBrowse] = useState(false);
-  const [valueSuggestions, setValueSuggestions] = useState([]);
   const [recent, setRecent] = useState(() => {
     try {
       const raw = window.localStorage.getItem(storageKey);
@@ -288,7 +282,6 @@ export default function Search({
   const listRef = useRef(null);
   const blurTimer = useRef(null);
   const debounceTimer = useRef(null);
-  const valueReqId = useRef(0);
   const lastPushed = useRef({ filter: null, orderBy: null });
 
   // ---- compile on every keystroke (cheap) ---------------------------------
@@ -366,22 +359,6 @@ export default function Search({
     return p;
   }, [browse, completion]);
 
-  // Async value suggestions when sitting in a value slot
-  useEffect(() => {
-    const wantsValues =
-      (completion.context === CONTEXT.VALUE || completion.context === CONTEXT.IN_LIST) &&
-      completion.activeField && getValueSuggestions;
-    if (!wantsValues) { setValueSuggestions([]); return; }
-
-    const def = fieldMap.get(String(completion.activeField).toLowerCase());
-    if (!def) { setValueSuggestions([]); return; }
-
-    const id = ++valueReqId.current;
-    Promise.resolve(getValueSuggestions(def, effectivePartial))
-      .then((vals) => { if (valueReqId.current === id) setValueSuggestions(vals || []); })
-      .catch(() => { if (valueReqId.current === id) setValueSuggestions([]); });
-  }, [completion.context, completion.activeField, effectivePartial, fieldMap, getValueSuggestions]);
-
   // ---- build categorized suggestion list -------------------------------------
   const suggestions = useMemo(() => {
     const partial = effectivePartial.toLowerCase();
@@ -432,16 +409,8 @@ export default function Search({
 
       case CONTEXT.VALUE:
       case CONTEXT.IN_LIST:
-        valueSuggestions.filter(match).forEach((v) => items.push({
-          category: 'Values',
-          insert: /^-?\d+(\.\d+)?$/.test(v) ? v : `"${v}"`,
-          label: v,
-          hint: completion.activeField,
-        }));
-        if (completion.context === CONTEXT.VALUE && match('(')) {
-          // after IN
-          items.push({ category: 'Keywords', insert: '(', label: '(', hint: 'start IN list', noSpace: true });
-        }
+        // No dropdown in value slots — after an operator the user types the
+        // value (and the opening paren of an IN list) freely.
         break;
 
       case CONTEXT.IS_WHAT:
@@ -463,7 +432,7 @@ export default function Search({
         break;
     }
     return items;
-  }, [completion, effectivePartial, fields, fieldMap, valueSuggestions]);
+  }, [completion, effectivePartial, fields, fieldMap]);
 
   useEffect(() => { setHighlight(0); }, [suggestions.length, effectivePartial]);
 
