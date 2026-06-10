@@ -45,7 +45,7 @@ import React, {
   useState, useRef, useMemo, useEffect, useCallback,
 } from 'react';
 import {
-  jqlToAmps, getCompletionContext, CONTEXT, ParseError,
+  jqlToAmps, getCompletionContext, CONTEXT, ParseError, encodeFieldName,
 } from './uiQueryToAmps';
 
 /* ===========================================================================
@@ -129,6 +129,8 @@ function buildFieldMap(fields) {
       .replace(/[^A-Za-z0-9]+(.)/g, (_, c) => c.toUpperCase())
       .replace(/[^A-Za-z0-9]/g, '');
     if (camel) map.set(camel.toLowerCase(), f);
+    // URL-encoded header name: what the dropdown inserts ("Order%20Status")
+    map.set(encodeFieldName(f.headerName).toLowerCase(), f);
   });
   return map;
 }
@@ -366,12 +368,12 @@ export default function Search({
     const items = [];
 
     const pushFields = () => fields.filter((f) =>
-      match(f.field) || match(f.headerName)
+      match(f.field) || match(f.headerName) || match(encodeFieldName(f.headerName))
     ).forEach((f) => items.push({
       category: 'Fields',
-      insert: f.field,
-      label: f.field,
-      hint: `${f.headerName} · ${f.dataType}`,
+      insert: encodeFieldName(f.headerName), // "Order Status" -> Order%20Status in the query
+      label: f.headerName,                   // human-readable in the dropdown
+      hint: `${f.field} · ${f.dataType}`,
     }));
 
     switch (completion.context) {
