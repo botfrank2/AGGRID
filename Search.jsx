@@ -56,6 +56,22 @@ import {
  * Field extraction from the AG Grid API
  * =========================================================================== */
 
+// Design-system convention: right-aligned cells are numeric. Extend this
+// list if your grid uses other alignment/format classes for numbers.
+const NUMERIC_CELL_CLASSES = ['lmn-text-right'];
+
+function cellClassIndicatesNumber(colDef) {
+  let cls = colDef.cellClass;
+  if (typeof cls === 'function') {
+    // cellClass can be (params) => string | string[]; probe it defensively
+    try { cls = cls({ value: 0, data: {}, colDef }); } catch (e) { cls = null; }
+  }
+  const list = (Array.isArray(cls) ? cls : typeof cls === 'string' ? [cls] : [])
+    .filter((c) => typeof c === 'string')
+    .flatMap((c) => c.split(/\s+/));
+  return list.some((c) => NUMERIC_CELL_CLASSES.includes(c));
+}
+
 function inferDataType(colDef) {
   if (typeof colDef.cellDataType === 'string') {
     if (colDef.cellDataType.startsWith('number')) return 'number';
@@ -68,6 +84,9 @@ function inferDataType(colDef) {
   if (types.some((t) => /date/i.test(t))) return 'date';
   if (colDef.filter === 'agNumberColumnFilter') return 'number';
   if (colDef.filter === 'agDateColumnFilter') return 'date';
+  // grids where every colDef is untyped but numeric columns carry a
+  // right-align class (e.g. cellClass: 'lmn-text-right')
+  if (cellClassIndicatesNumber(colDef)) return 'number';
   if (colDef.context && colDef.context.dataType) return colDef.context.dataType;
   return 'string';
 }
