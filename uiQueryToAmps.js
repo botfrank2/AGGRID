@@ -48,7 +48,7 @@ const KEYWORDS = new Set([
 
 const OPERATOR_RE = /^(!=|>=|<=|!~|=|>|<|~)/;
 const NUMBER_RE = /^-?\d+(\.\d+)?(?![\w.])/;
-const WORD_RE = /^[A-Za-z_][A-Za-z0-9_.$-]*/;
+const WORD_RE = /^[A-Za-z_][A-Za-z0-9_.$%-]*/; // % so URL-encoded header names (Order%20Status) stay one token
 
 /**
  * @param {string} input
@@ -264,17 +264,48 @@ class Parser {
   }
 
   parseClause() {
+    const t0 = this.peek();
+    if (!t0) throw new ParseError('Unexpected end of query');
+
+    // Bare comparison across all searchable fields:  > 100, <= 99.5, ~ "abc"
+    if (t0.type === TOKEN.OPERATOR) {
+      this.next();
+      const v = this.next();
+      if (!v || (v.type !== TOKEN.STRING && v.type !== TOKEN.NUMBER && v.type !== TOKEN.FIELD)) {
+        throw new ParseError(`Expected a value after "${t0.value}"`, v);
+      }
+      return { type: 'clause', op: 'cmp_all', cmp: t0.value, value: v.value, valueKind: v.type, opToken: t0 };
+    }
+
+    // Quoted or numeric bare keyword:  "jane street", 500
+    if (t0.type === TOKEN.STRING || t0.type === TOKEN.NUMBER) {
+      this.next();
+      return { type: 'clause', op: 'keyword', value: t0.value, valueKind: t0.type, fieldToken: t0 };
+    }
+
     const fieldTok = this.next();
     if (!fieldTok || fieldTok.type !== TOKEN.FIELD) {
       throw new ParseError(
-        `Expected a field name${fieldTok ? ` but found "${fieldTok.raw}"` : ''}`,
+        `Expected a field name or search term${fieldTok ? ` but found "${fieldTok.raw}"` : ''}`,
         fieldTok
       );
     }
     const field = fieldTok.value;
 
+    // Bare-word keyword term: a word NOT followed by an operator / IS / IN /
+    // NOT IN is a free-text search across all searchable fields.
+    //   AAPL.OQ OR MSFT.N   ->  keyword(AAPL.OQ) OR keyword(MSFT.N)
     const t = this.peek();
-    if (!t) throw new ParseError(`Expected an operator after "${field}"`);
+    const followsOp = t && (
+      t.type === TOKEN.OPERATOR ||
+      (t.type === TOKEN.KEYWORD && (
+        t.value === 'IS' || t.value === 'IN' ||
+        (t.value === 'NOT' && this.peek(1) && this.peek(1).type === TOKEN.KEYWORD && this.peek(1).value === 'IN')
+      ))
+    );
+    if (!followsOp) {
+      return { type: 'clause', op: 'keyword', value: field, valueKind: TOKEN.FIELD, fieldToken: fieldTok };
+    }
 
     // field IS [NOT] EMPTY|NULL
     if (t.type === TOKEN.KEYWORD && t.value === 'IS') {
@@ -352,6 +383,17 @@ export function parseJql(input) {
 // AMPS filter builder
 // ---------------------------------------------------------------------------
 
+/**
+ * Encode a human-readable column name so it can appear as a single query
+ * token, URL-style: spaces (and any other unsafe char) -> %HH.
+ *   "Order Status" -> "Order%20Status"
+ * The field map stores this encoded form, so it resolves like any alias.
+ */
+export function encodeFieldName(name) {
+  return String(name).replace(/[^A-Za-z0-9_.$-]/g, (c) =>
+    '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+}
+
 /** AG Grid field path -> AMPS XPath identifier. "order.qty" -> "/order/qty" */
 export function toAmpsPath(fieldPath) {
   return '/' + String(fieldPath).split('.').join('/');
@@ -393,9 +435,17 @@ function renderLiteral(value, fieldDef) {
  *        fieldDef = { field: 'order.qty', headerName: 'Quantity', dataType: 'number' }
  *        Unknown fields throw, so typos surface in the UI instead of
  *        silently producing a filter the AMPS server will reject.
+ * @param {object}  [options]
+ * @param {Array}   [options.keywordFields]  fieldDefs that bare keyword terms
+ *        and bare comparisons (`AAPL.OQ`, `> 100`) expand across — typically
+ *        the grid's VISIBLE columns. Defaults to every unique def in fieldMap.
  */
-export function buildAmpsFilter(ast, fieldMap) {
+export function buildAmpsFilter(ast, fieldMap, options = {}) {
   if (!ast) return '';
+
+  const keywordFields = (options.keywordFields && options.keywordFields.length)
+    ? options.keywordFields
+    : Array.from(new Set(fieldMap ? fieldMap.values() : []));
 
   const resolve = (name, token) => {
     const def = fieldMap && fieldMap.get(String(name).toLowerCase());
@@ -403,6 +453,46 @@ export function buildAmpsFilter(ast, fieldMap) {
       throw new ParseError(`Unknown field "${name}" — not present in the grid's column definitions`, token);
     }
     return def;
+  };
+
+  // keyword term -> OR fan-out across searchable fields:
+  //   string fields: case-insensitive contains (LIKE)
+  //   number fields: equality, only when the term itself is numeric
+  //   date/boolean fields: skipped (no sensible free-text match)
+  const keywordClause = (value, token) => {
+    const isNum = isNumericLiteral(value);
+    const parts = [];
+    keywordFields.forEach((d) => {
+      if (d.dataType === 'number') {
+        if (isNum) parts.push(`${toAmpsPath(d.field)} = ${value}`);
+      } else if (d.dataType !== 'date' && d.dataType !== 'boolean') {
+        parts.push(`${toAmpsPath(d.field)} LIKE '(?i)${escapeAmpsString(escapeRegex(value))}'`);
+      }
+    });
+    if (parts.length === 0) {
+      throw new ParseError(`No searchable fields can match "${value}"`, token);
+    }
+    return parts.length === 1 ? parts[0] : `(${parts.join(' OR ')})`;
+  };
+
+  // bare comparison -> fan-out across type-compatible fields:
+  //   numeric literal: number fields    (> 100  ->  /qty > 100 OR /price > 100)
+  //   string literal:  string fields    (> "M"  ->  lexicographic compare)
+  const cmpAllClause = (node) => {
+    if (node.cmp === '~') return keywordClause(node.value, node.opToken);
+    if (node.cmp === '!~') return `NOT (${keywordClause(node.value, node.opToken)})`;
+
+    const isNum = isNumericLiteral(node.value);
+    const defs = keywordFields.filter((d) => (isNum ? d.dataType === 'number' : d.dataType === 'string'));
+    if (defs.length === 0) {
+      throw new ParseError(
+        `No ${isNum ? 'numeric' : 'text'} fields available for a bare "${node.cmp}" comparison`,
+        node.opToken
+      );
+    }
+    const lit = isNum ? String(node.value) : `'${escapeAmpsString(node.value)}'`;
+    const parts = defs.map((d) => `${toAmpsPath(d.field)} ${node.cmp} ${lit}`);
+    return parts.length === 1 ? parts[0] : `(${parts.join(' OR ')})`;
   };
 
   const walk = (node) => {
@@ -429,6 +519,10 @@ export function buildAmpsFilter(ast, fieldMap) {
   };
 
   const clause = (node) => {
+    // Field-less clauses first — they fan out instead of resolving one field.
+    if (node.op === 'keyword') return keywordClause(node.value, node.fieldToken);
+    if (node.op === 'cmp_all') return cmpAllClause(node);
+
     const def = resolve(node.field, node.fieldToken);
     const path = toAmpsPath(def.field);
 
@@ -486,10 +580,10 @@ export function buildAmpsOrderBy(orderBy, fieldMap) {
  * One-shot convenience: JQL string -> { ampsFilter, ampsOrderBy, ast }.
  * Throws ParseError with .position on bad input.
  */
-export function jqlToAmps(input, fieldMap) {
+export function jqlToAmps(input, fieldMap, options = {}) {
   const { where, orderBy } = parseJql(input);
   return {
-    ampsFilter: buildAmpsFilter(where, fieldMap),
+    ampsFilter: buildAmpsFilter(where, fieldMap, options),
     ampsOrderBy: buildAmpsOrderBy(orderBy, fieldMap),
     ast: where,
   };
@@ -567,12 +661,13 @@ export function getCompletionContext(input, caret) {
         break;
 
       case TOKEN.OPERATOR:
-        if (context === CONTEXT.OPERATOR) context = CONTEXT.VALUE;
+        if (context === CONTEXT.OPERATOR || context === CONTEXT.FIELD) context = CONTEXT.VALUE; // FIELD: bare comparison
         break;
 
       case TOKEN.STRING:
       case TOKEN.NUMBER:
         if (context === CONTEXT.VALUE) context = CONTEXT.JOINER;
+        else if (context === CONTEXT.FIELD) context = CONTEXT.JOINER; // bare keyword term
         break;
 
       case TOKEN.KEYWORD:
