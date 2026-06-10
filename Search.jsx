@@ -29,6 +29,15 @@
  *   storageKey           localStorage key for recent searches
  *   placeholder          input placeholder text
  *
+ * Keyword search:
+ *   Bare terms (no field, no operator) search across ALL VISIBLE grid
+ *   columns and can be chained:
+ *     AAPL.OQ OR MSFT.N      -> contains-match fan-out over visible columns
+ *     AAPL.OQ AND "Filled"   -> both terms must match somewhere in the row
+ *     > 100  /  <= 99.5      -> bare comparison across visible numeric columns
+ *   Keyword terms can be mixed freely with field clauses:
+ *     AAPL.OQ AND qty > 1000
+ *
  * Interaction model:
  *   - typing: prefix-filtered autocomplete (Fields / Operators / Values / Keywords)
  *   - clicking an existing token: shows the FULL list for that slot and the
@@ -109,18 +118,35 @@ function buildFieldMap(fields) {
   return map;
 }
 
+/** Set of colDef.field values for currently displayed columns, or null if undeterminable. */
+function getVisibleFieldSet(gridApi, columnApi) {
+  const api = (columnApi && typeof columnApi.getAllDisplayedColumns === 'function') ? columnApi : gridApi;
+  if (!api || typeof api.getAllDisplayedColumns !== 'function') return null;
+  const cols = api.getAllDisplayedColumns() || [];
+  return new Set(
+    cols
+      .map((c) => (c.getColDef ? c.getColDef().field : c.field))
+      .filter(Boolean)
+  );
+}
+
 function useGridFields(gridApi, columnApi) {
   const [fields, setFields] = useState([]);
+  const [visibleSet, setVisibleSet] = useState(null);
 
   const refresh = useCallback(() => {
     if (!gridApi) return;
     setFields(extractFieldsFromGrid(gridApi, columnApi));
+    setVisibleSet(getVisibleFieldSet(gridApi, columnApi));
   }, [gridApi, columnApi]);
 
   useEffect(() => {
     refresh();
     if (!gridApi || typeof gridApi.addEventListener !== 'function') return undefined;
-    const events = ['gridColumnsChanged', 'newColumnsLoaded', 'columnEverythingChanged'];
+    const events = [
+      'gridColumnsChanged', 'newColumnsLoaded', 'columnEverythingChanged',
+      'displayedColumnsChanged', 'columnVisible', // keep keyword scope in sync with hidden/shown columns
+    ];
     events.forEach((e) => gridApi.addEventListener(e, refresh));
     return () => {
       events.forEach((e) => {
@@ -129,7 +155,18 @@ function useGridFields(gridApi, columnApi) {
     };
   }, [gridApi, refresh]);
 
-  return { fields, fieldMap: useMemo(() => buildFieldMap(fields), [fields]) };
+  // Keyword terms fan out across VISIBLE columns only; if visibility can't be
+  // determined (mocked api, very old grid), fall back to all fields.
+  const visibleFields = useMemo(
+    () => (visibleSet ? fields.filter((f) => visibleSet.has(f.field)) : fields),
+    [fields, visibleSet]
+  );
+
+  return {
+    fields,
+    visibleFields,
+    fieldMap: useMemo(() => buildFieldMap(fields), [fields]),
+  };
 }
 
 /* ===========================================================================
@@ -208,9 +245,9 @@ export default function Search({
   autoApply = true,
   debounceMs = 400,
   storageKey = 'jql-amps-recent',
-  placeholder = 'e.g.  symbol = "IBM" AND qty > 1000 ORDER BY price DESC',
+  placeholder = 'e.g.  AAPL.OQ OR MSFT.N   ·   symbol = "IBM" AND qty > 1000 ORDER BY price DESC',
 }) {
-  const { fields, fieldMap } = useGridFields(gridApi, columnApi);
+  const { fields, visibleFields, fieldMap } = useGridFields(gridApi, columnApi);
 
   const [query, setQuery] = useState('');
   const [caret, setCaret] = useState(0);
@@ -240,7 +277,7 @@ export default function Search({
     const trimmed = query.trim();
     if (!trimmed) return { status: 'empty', ampsFilter: '', ampsOrderBy: '' };
     try {
-      const { ampsFilter, ampsOrderBy } = jqlToAmps(trimmed, fieldMap);
+      const { ampsFilter, ampsOrderBy } = jqlToAmps(trimmed, fieldMap, { keywordFields: visibleFields });
       return { status: 'valid', ampsFilter, ampsOrderBy };
     } catch (e) {
       return {
@@ -249,7 +286,7 @@ export default function Search({
         position: e instanceof ParseError ? e.position : null,
       };
     }
-  }, [query, fieldMap]);
+  }, [query, fieldMap, visibleFields]);
 
   // ---- push the compiled filter into the consumer's state ------------------
   const push = useCallback((ampsFilter, ampsOrderBy) => {
@@ -276,11 +313,11 @@ export default function Search({
     const jql = (q !== undefined ? q : query).trim();
     if (!jql) { push('', ''); return; }
     try {
-      const { ampsFilter, ampsOrderBy } = jqlToAmps(jql, fieldMap);
+      const { ampsFilter, ampsOrderBy } = jqlToAmps(jql, fieldMap, { keywordFields: visibleFields });
       if (explicit) saveRecent(jql);
       push(ampsFilter, ampsOrderBy);
     } catch (e) { /* invalid — status row already shows the error */ }
-  }, [query, fieldMap, push, saveRecent]);
+  }, [query, fieldMap, visibleFields, push, saveRecent]);
 
   // auto-apply (debounced) on every valid edit; clears when query is emptied
   useEffect(() => {
@@ -348,6 +385,9 @@ export default function Search({
         if (completion.context === CONTEXT.FIELD) {
           if (match('NOT')) items.push({ category: 'Keywords', insert: 'NOT', label: 'NOT', hint: 'negate a group' });
           if (match('(')) items.push({ category: 'Keywords', insert: '(', label: '(', hint: 'open group', noSpace: true });
+          // bare comparisons fan out across visible numeric/text columns
+          ['>', '>=', '<', '<='].filter(match).forEach((op) =>
+            items.push({ category: 'Operators', insert: op, label: op, hint: 'compare across visible fields' }));
         }
         break;
 
@@ -355,11 +395,19 @@ export default function Search({
         const def = completion.activeField
           ? fieldMap.get(String(completion.activeField).toLowerCase())
           : null;
+        // Unknown word -> it's a keyword term, not a field: allow every
+        // operator shape after it is replaced, but lead with AND/OR.
+        const isKnownField = !!def;
         const numeric = def && (def.dataType === 'number' || def.dataType === 'date');
         OPERATORS
-          .filter((op) => (numeric || !op.numeric))
+          .filter((op) => (!isKnownField || numeric || !op.numeric))
           .filter((op) => match(op.label))
           .forEach((op) => items.push({ category: 'Operators', insert: op.label, label: op.label, hint: op.hint }));
+        // The word before the caret may be a bare keyword term
+        // (e.g. AAPL.OQ), so chaining with AND / OR is also valid here.
+        [{ label: 'AND', hint: 'chain keyword/clause' }, { label: 'OR', hint: 'chain keyword/clause' }]
+          .filter((j) => match(j.label))
+          .forEach((j) => items.push({ category: 'Keywords', insert: j.label, label: j.label, hint: j.hint }));
         break;
       }
 
@@ -573,7 +621,7 @@ export default function Search({
         )}
         {compiled.status === 'empty' && (
           <span className="jqlbar__statusHint">
-            Type a field name to start — suggestions come from the grid columns. Enter applies the filter.
+            Type a keyword (searches all visible columns) or a field name — chain with AND / OR. Enter applies the filter.
           </span>
         )}
       </div>
